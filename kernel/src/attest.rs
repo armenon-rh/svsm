@@ -32,7 +32,6 @@ use cocoon_tpm_utils_common::{
 use kbs_types::Tee;
 use libaproxy::*;
 use serde::Serialize;
-use sha2::{Digest, Sha512};
 use zerocopy::{FromBytes, IntoBytes};
 
 // TODO: Make the IO port configurable/discoverable or drop the support entirely.
@@ -411,22 +410,10 @@ fn evidence(tee: &Tee, hash: Vec<u8>) -> Result<AttestationEvidence, Attestation
 /// attestation evidence.
 fn hash(
     n: &NegotiationResponse,
-    pub_key: &TpmsEccPoint<'static>,
+    _pub_key: &TpmsEccPoint<'static>,
 ) -> Result<Vec<u8>, AttestationError> {
-    let mut sha = Sha512::new();
-
-    for p in &n.params {
-        match p {
-            NegotiationParam::Challenge => {
-                sha.update(&n.challenge);
-            }
-            #[allow(irrefutable_let_patterns)]
-            NegotiationParam::EcPublicKeyBytes => {
-                sha.update(&*pub_key.x.buffer);
-                sha.update(&*pub_key.y.buffer);
-            }
-        }
-    }
-
-    try_to_vec(&sha.finalize()).or(Err(AttestationError::VecAlloc))
+    // Hashing is actually performed in aproxy backend kbs. Sha384 hash function is used
+    let mut report_data = [0u8; 64];
+    report_data[..48].copy_from_slice(&n.challenge);
+    Ok(report_data.to_vec())
 }

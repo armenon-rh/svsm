@@ -66,6 +66,7 @@ userlib = { path = "user/lib" }
 userinit = { path = "user/init" }
 release = { path = "release" }
 virtio-drivers = { git = "https://github.com/coconut-svsm/virtio-drivers.git", rev = "dcbdbc8cefc0c985322382acdeb633a63a3a4cc1" }
+serde_bytes = { version = "0.11", default-features = false }
 
 # crates.io
 aes-gcm = { version = "0.10.3", default-features = false }
