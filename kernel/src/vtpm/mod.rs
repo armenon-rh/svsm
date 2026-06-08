@@ -87,7 +87,7 @@ pub trait VtpmInterface: TcgTpmSimulatorInterface {
 
     /// Prepare the TPM to be used for the first time. At this stage,
     /// the TPM is manufactured.
-    fn init(&mut self) -> Result<(), SvsmReqError>;
+    fn init(&mut self, state: Option<&mut [u8]>) -> Result<(), SvsmReqError>;
 
     /// Returns the cached EK public key if it exists, otherwise it returns an error indicating
     /// that the EK public key does not exist.
@@ -99,12 +99,13 @@ static VTPM: SpinLock<Vtpm> = SpinLock::new(Vtpm::new());
 
 /// Initialize the TPM by calling the init() implementation of the
 /// [`VtpmInterface`]
-pub fn vtpm_init() -> Result<(), SvsmReqError> {
+pub fn vtpm_init(state: Option<&mut [u8]>, key: Option<&[u8]>) -> Result<(), SvsmReqError> {
     let mut vtpm = VTPM.lock();
     if vtpm.is_powered_on() {
         return Ok(());
     }
-    vtpm.init()?;
+    vtpm.set_key(key);
+    vtpm.init(state)?;
     Ok(())
 }
 

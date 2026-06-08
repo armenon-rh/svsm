@@ -554,7 +554,7 @@ fn svsm_init(launch_info: &KernelLaunchInfo) {
     }
 
     #[cfg(all(feature = "vtpm", not(test)))]
-    vtpm_init().expect("vTPM failed to initialize");
+    vtpm_init(None, None).expect("vTPM failed to initialize");
 
     virt_log_usage();
 

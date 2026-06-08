@@ -38,6 +38,7 @@ use crate::{
 pub struct TcgTpm {
     is_powered_on: bool,
     ekpub: Option<Vec<u8>>,
+    key: Option<Vec<u8>>, // This is the kbs secret used to encrypt the state.
 }
 
 impl TcgTpm {
@@ -45,6 +46,7 @@ impl TcgTpm {
         TcgTpm {
             is_powered_on: false,
             ekpub: None,
+            key: None,
         }
     }
 
@@ -73,6 +75,16 @@ impl TcgTpm {
                 log::error!("TPM_Manufacture failed rc={rc}");
                 Err(SvsmReqError::incomplete())
             }
+        }
+    }
+
+    pub fn set_key(&mut self, key: Option<&[u8]>) {
+        self.key = key.map(|k| k.to_vec());
+
+        if self.key.is_some() {
+            log::info!("vTPM: Attestation key has been set and stored.");
+        } else {
+            log::info!("vTPM: Attestation key is not available");
         }
     }
 }
@@ -186,7 +198,7 @@ impl VtpmInterface for TcgTpm {
         self.is_powered_on
     }
 
-    fn init(&mut self) -> Result<(), SvsmReqError> {
+    fn init(&mut self, state: Option<&mut [u8]>) -> Result<(), SvsmReqError> {
         // Initialize the TPM TCG following the same steps done in the Simulator:
         //
         // 1. Manufacture it for the first time
@@ -196,8 +208,13 @@ impl VtpmInterface for TcgTpm {
         // 5. Power it on indicating it requires startup. By default, OVMF will start
         //    and selftest it.
 
+        let (ptr, size) = match state {
+            Some(buf) => (buf.as_mut_ptr() as *mut c_void, buf.len() as u32),
+            None => (VirtAddr::null().as_mut_ptr::<c_void>(), 0),
+        };
+
         // SAFETY: FFI call. Parameters and return values are checked.
-        let mut rc = unsafe { _plat__NVEnable(VirtAddr::null().as_mut_ptr::<c_void>(), 0) };
+        let mut rc = unsafe { _plat__NVEnable(ptr, size as usize) };
         if rc != 0 {
             log::error!("_plat__NVEnable failed rc={rc}");
             return Err(SvsmReqError::incomplete());
