@@ -169,6 +169,7 @@ impl AttestationDriver<'_> {
             evidence,
             challenge: n.challenge.clone(),
             key: (self.ecc.pub_key().get_curve_id(), &pub_key).into(),
+            resource_id: None,
         };
 
         self.write(req)?;

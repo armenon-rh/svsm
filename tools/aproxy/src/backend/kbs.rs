@@ -16,8 +16,10 @@ use reqwest::StatusCode;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
-#[derive(Clone, Copy, Debug, Default)]
-pub struct KbsProtocol;
+#[derive(Clone, Debug, Default)]
+pub struct KbsProtocol {
+    pub(crate) resource_id: Option<String>,
+}
 
 #[derive(Deserialize, Debug)]
 struct TokenResponse {

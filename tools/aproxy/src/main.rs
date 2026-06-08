@@ -42,6 +42,10 @@ struct Args {
     /// Force Unix domain socket removal before bind
     #[clap(long, short, conflicts_with = "vsock", default_value_t = false)]
     force: bool,
+
+    /// Optional Resource ID (UUID) requested from KBS.
+    #[clap(long)]
+    resource_id: Option<String>,
 }
 
 /// Enum to represent possible backends in the CLI.
@@ -56,10 +60,12 @@ fn accept_loop<S: Read + Write>(
     incoming: impl Iterator<Item = std::io::Result<S>>,
     url: &str,
     backend: ArgsBackend,
+    resource_id: Option<String>,
 ) -> anyhow::Result<()> {
     for stream in incoming {
         let mut stream = stream.context("Failed to accept connection")?;
         let mut http_client = backend::HttpClient::new(url.to_string(), backend.into())?;
+        http_client.set_resource_id(resource_id.clone());
         attest::attest(&mut stream, &mut http_client)?;
     }
     Ok(())
@@ -71,14 +77,14 @@ fn main() -> anyhow::Result<()> {
     if let Some(port) = args.vsock {
         let listener = VsockListener::bind(&VsockAddr::new(VMADDR_CID_ANY, port))
             .context("bind and listen failed")?;
-        accept_loop(listener.incoming(), &args.url, args.backend)?;
+        accept_loop(listener.incoming(), &args.url, args.backend, args.resource_id)?;
     } else if let Some(unix) = args.unix {
         if args.force {
             let _ = fs::remove_file(&unix);
         }
 
         let listener = UnixListener::bind(unix).context("unable to bind to UNIX socket")?;
-        accept_loop(listener.incoming(), &args.url, args.backend)?;
+        accept_loop(listener.incoming(), &args.url, args.backend, args.resource_id)?;
     }
 
     Ok(())

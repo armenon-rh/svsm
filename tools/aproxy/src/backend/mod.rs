@@ -13,6 +13,7 @@ use kbs::KbsProtocol;
 use libaproxy::*;
 use reqwest::{blocking::Client, cookie::Jar};
 use std::sync::Arc;
+use std::mem;
 
 /// HTTP client and protocol identifier.
 #[derive(Clone, Debug)]
@@ -32,23 +33,36 @@ impl HttpClient {
         Ok(Self { cli, url, protocol })
     }
 
-    pub fn negotiation(&mut self, req: NegotiationRequest) -> anyhow::Result<NegotiationResponse> {
-        // Depending on the underlying protocol of the attestation server, gather negotiation
-        // parameters accordingly.
-        match self.protocol {
-            Protocol::Kbs(mut kbs) => kbs.negotiation(self, req),
+    pub fn set_resource_id(&mut self, resource_id: Option<String>) {
+        match &mut self.protocol {
+            Protocol::Kbs(kbs) => kbs.resource_id = resource_id,
         }
     }
 
+    pub fn negotiation(&mut self, req: NegotiationRequest) -> anyhow::Result<NegotiationResponse> {
+        // Depending on the underlying protocol of the attestation server, gather negotiation
+        // parameters accordingly.
+        let mut protocol = mem::replace(&mut self.protocol, Protocol::Kbs(KbsProtocol::default()));
+        let result = match &mut protocol {
+            Protocol::Kbs(kbs) => kbs.negotiation(self, req),
+        };
+        self.protocol = protocol;
+        result
+    }
+
     pub fn attestation(&mut self, req: AttestationRequest) -> anyhow::Result<AttestationResponse> {
-        match self.protocol {
-            Protocol::Kbs(mut kbs) => kbs.attestation(self, req),
-        }
+        let mut protocol = mem::replace(&mut self.protocol, Protocol::Kbs(KbsProtocol::default()));
+
+        let result = match &mut protocol {
+            Protocol::Kbs(kbs) => kbs.attestation(self, req),
+        };
+        self.protocol = protocol;
+        result
     }
 }
 
 /// Attestation Protocol identifier.
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Debug)]
 pub enum Protocol {
     Kbs(KbsProtocol),
 }
@@ -56,7 +70,7 @@ pub enum Protocol {
 impl From<ArgsBackend> for Protocol {
     fn from(value: ArgsBackend) -> Self {
         match value {
-            ArgsBackend::Kbs => Self::Kbs(KbsProtocol),
+            ArgsBackend::Kbs => Self::Kbs(KbsProtocol::default()),
         }
     }
 }
