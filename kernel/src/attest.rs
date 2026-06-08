@@ -138,9 +138,20 @@ impl AttestationDriver<'_> {
     /// that should be included in attestation evidence (e.g. through SEV-SNP's REPORT_DATA
     /// mechanism).
     fn negotiation(&mut self) -> Result<NegotiationResponse, AttestationError> {
+        let curve = Curve::new(self.ecc.pub_key().get_curve_id())
+            .map_err(AttestationError::Crypto)?;
+
+        let pub_key = self.ecc.pub_key()
+            .to_tpms_ecc_point(&curve.curve_ops().map_err(AttestationError::Crypto)?)
+            .map_err(AttestationError::Crypto)?;
+
         let request = NegotiationRequest {
             version: (0, 1, 0), // Only version supported at present.
             tee: self.tee,
+            key: EcP256PublicKey {
+                x: pub_key.x.buffer.to_vec(),
+                y: pub_key.y.buffer.to_vec(),
+            },
         };
 
         self.write(request)?;
