@@ -21,12 +21,14 @@ pub struct NegotiationRequest {
 }
 
 /// A parameter that must be hashed into the negotiation hash.
-#[derive(Serialize, Deserialize, Debug)]
+#[derive(Serialize, Deserialize, Debug, Clone, Copy, PartialEq, Eq)]
 pub enum NegotiationParam {
     /// Hash the challenge returned from attestation server.
     Challenge,
     /// Hash the EC public key's `Elliptic-Curve-Point-to-Octet-String` encoding.
     EcPublicKeyBytes,
+    /// Format, serialize, and hash the standard JWS JSON representation of runtime_data.
+    JwsJsonRuntimeData,
 }
 
 #[derive(Serialize, Deserialize, Debug)]

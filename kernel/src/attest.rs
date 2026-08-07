@@ -19,7 +19,7 @@ use crate::{io::DEFAULT_IO_DRIVER, serial::SerialPort};
 use crate::{vsock::VMADDR_CID_HOST, vsock::stream::VsockStream};
 use aes_gcm::{AeadInPlace, Aes256Gcm, KeyInit, Nonce, aead::generic_array::GenericArray};
 use aes_kw::{KeyInit as _, KwAes256};
-use alloc::{string::ToString, vec::Vec};
+use alloc::{collections::BTreeMap, string::ToString, vec::Vec};
 use cocoon_tpm_crypto::{
     CryptoError,
     ecc::{EccKey, curve::Curve, ecdh::ecdh_c_1_1_cdh_compute_z},
@@ -28,7 +28,8 @@ use cocoon_tpm_tpm2_interface::{TpmEccCurve, TpmsEccPoint};
 use kbs_types::Tee;
 use libaproxy::*;
 use serde::Serialize;
-use sha2::{Digest, Sha512};
+use serde_json::json;
+use sha2::{Digest, Sha384, Sha512};
 use zerocopy::{FromBytes, IntoBytes};
 
 #[cfg(feature = "attest-serial")]
@@ -375,26 +376,60 @@ fn evidence(tee: &Tee, hash: Vec<u8>) -> Result<AttestationEvidence, Attestation
     Ok(evidence)
 }
 
+fn base64url_encode(input: &[u8]) -> alloc::string::String {
+    BASE64_URL_SAFE_NO_PAD.encode(input)
+}
+
+fn base64_encode(input: &[u8]) -> alloc::string::String {
+    BASE64_STANDARD.encode(input)
+}
+
 /// Hash the negotiation parameters from the attestation server for inclusion in the
 /// attestation evidence.
 fn hash(
     n: &NegotiationResponse,
     pub_key: &TpmsEccPoint<'static>,
 ) -> Result<Vec<u8>, AttestationError> {
-    let mut sha = Sha512::new();
+    if n.params.contains(&NegotiationParam::JwsJsonRuntimeData) {
+        let x_encoded = base64url_encode(&pub_key.x.buffer);
+        let y_encoded = base64url_encode(&pub_key.y.buffer);
+        let nonce_encoded = base64_encode(&n.challenge);
 
-    for p in &n.params {
-        match p {
-            NegotiationParam::Challenge => {
-                sha.update(&n.challenge);
-            }
-            #[allow(irrefutable_let_patterns)]
-            NegotiationParam::EcPublicKeyBytes => {
-                sha.update(&*pub_key.x.buffer);
-                sha.update(&*pub_key.y.buffer);
+        let mut key_map = BTreeMap::new();
+        key_map.insert("alg".to_string(), json!("ECDH-ES+A256KW"));
+        key_map.insert("crv".to_string(), json!("P-521"));
+        key_map.insert("kty".to_string(), json!("EC"));
+        key_map.insert("x".to_string(), json!(x_encoded));
+        key_map.insert("y".to_string(), json!(y_encoded));
+
+        let mut runtime_data = BTreeMap::new();
+        runtime_data.insert("additional-evidence".to_string(), json!(""));
+        runtime_data.insert("nonce".to_string(), json!(nonce_encoded));
+        runtime_data.insert("tee-pubkey".to_string(), json!(key_map));
+
+        let json_bytes = serde_json::to_vec(&runtime_data)
+            .map_err(|_| AttestationError::NegotiationSerialize)?;
+
+        let mut hasher = Sha384::new();
+        hasher.update(&json_bytes);
+        Ok(hasher.finalize().to_vec())
+    } else {
+        let mut sha = Sha512::new();
+
+        for p in &n.params {
+            match p {
+                NegotiationParam::Challenge => {
+                    sha.update(&n.challenge);
+                }
+                #[allow(irrefutable_let_patterns)]
+                NegotiationParam::EcPublicKeyBytes => {
+                    sha.update(&*pub_key.x.buffer);
+                    sha.update(&*pub_key.y.buffer);
+                }
+                _ => unreachable!(),
             }
         }
-    }
 
-    try_to_vec(&sha.finalize()).or(Err(AttestationError::VecAlloc))
+        try_to_vec(&sha.finalize()).or(Err(AttestationError::VecAlloc))
+    }
 }
