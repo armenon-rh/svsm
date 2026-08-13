@@ -6,11 +6,8 @@
 // Author: Tyler Fanelli <tfanelli@redhat.com>
 
 use super::*;
-use anyhow::{Context, bail};
-use base64::{
-    Engine,
-    prelude::{BASE64_STANDARD, BASE64_URL_SAFE_NO_PAD},
-};
+use anyhow::{Context, anyhow};
+use base64::{Engine, prelude::BASE64_URL_SAFE_NO_PAD};
 use kbs_types::*;
 use reqwest::StatusCode;
 use serde::{Deserialize, Serialize};
@@ -60,21 +57,15 @@ impl AttestationProtocol for KbsProtocol {
         let challenge: Challenge =
             serde_json::from_str(&text).context("unable to convert KBS /auth response to JSON")?;
 
-        // Challenge nonce is a base64-encoded byte vector. Inform SVSM of this so it could
-        // decode the bytes and hash them into the TEE evidence.
-        let params = vec![
-            NegotiationParam::EcPublicKeyBytes,
-            NegotiationParam::Challenge,
-        ];
+        let decoded_nonce = BASE64_URL_SAFE_NO_PAD
+            .decode(&challenge.nonce)
+            .or_else(|_| base64::prelude::BASE64_STANDARD.decode(&challenge.nonce))
+            .context("unable to decode challenge nonce from base64")?;
 
-        let resp = NegotiationResponse {
-            challenge: BASE64_STANDARD
-                .decode(challenge.nonce)
-                .context("unable to decode challenge nonce from base64")?,
-            params,
-        };
-
-        Ok(resp)
+        Ok(NegotiationResponse {
+            challenge: decoded_nonce,
+            params: vec![NegotiationParam::JwsJsonRuntimeData],
+        })
     }
 
     /// With the serialized TEE evidence and key, complete the attestation. Serialize the evidence
@@ -92,7 +83,7 @@ impl AttestationProtocol for KbsProtocol {
         let attestation = Attestation {
             init_data: None,
             runtime_data: RuntimeData {
-                nonce: BASE64_STANDARD.encode(request.challenge),
+                nonce: base64::prelude::BASE64_STANDARD.encode(&request.challenge),
                 tee_pubkey: request.key.into(),
             },
             tee_evidence: CompositeEvidence {
@@ -218,33 +209,30 @@ fn unwrap_epk(resp: &Response) -> anyhow::Result<EcP256PublicKey> {
 #[serde(untagged)]
 enum KbsEvidence {
     Snp {
-        #[serde(rename = "snp-report")]
-        snp_report: String,
-        #[serde(rename = "certs-buf")]
-        certs_buf: Option<String>,
+        attestation_report: sev::firmware::guest::AttestationReport,
+        cert_chain: Option<Vec<u8>>,
     },
 }
 
 impl TryFrom<&AttestationRequest> for KbsEvidence {
     type Error = anyhow::Error;
-
-    // At the moment, only SEV-SNP evidence is allowed. However, preserve the following match
-    // statement to describe how other TEE architectures would serialize AttestationEvidence.
-    #[allow(irrefutable_let_patterns)]
     fn try_from(data: &AttestationRequest) -> anyhow::Result<Self> {
         match data.tee {
             Tee::Snp => {
                 let AttestationEvidence::Snp {
-                    ref report,
-                    ref certs_buf,
-                } = data.evidence
-                else {
-                    bail!("invalid SEV-SNP evidence")
-                };
+                    ref attestation_report,
+                    cert_chain: _,
+                } = data.evidence;
+
+                use sev::parser::Decoder;
+                let mut reader = std::io::Cursor::new(&attestation_report[..]);
+                let report_struct =
+                    sev::firmware::guest::AttestationReport::decode(&mut reader, ())
+                        .context("unable to decode AttestationReport using sev::parser::Decoder")?;
 
                 Ok(Self::Snp {
-                    snp_report: BASE64_STANDARD.encode(report),
-                    certs_buf: certs_buf.clone().map(|certs| BASE64_STANDARD.encode(certs)),
+                    attestation_report: report_struct,
+                    cert_chain: None,
                 })
             }
             _ => Err(anyhow!("invalid TEE")),

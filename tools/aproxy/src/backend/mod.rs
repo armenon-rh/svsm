@@ -8,7 +8,7 @@
 mod kbs;
 
 use crate::ArgsBackend;
-use anyhow::{Context, anyhow};
+use anyhow::Context;
 use kbs::KbsProtocol;
 use libaproxy::*;
 use reqwest::{blocking::Client, cookie::Jar};

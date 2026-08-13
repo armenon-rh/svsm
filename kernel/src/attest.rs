@@ -35,6 +35,7 @@ use zerocopy::{FromBytes, IntoBytes};
 #[cfg(feature = "attest-serial")]
 // TODO: Make the IO port configurable/discoverable or drop the support entirely.
 const ATTEST_DEFAULT_SERIAL_IO_ADDR: u16 = 0x3e8; // COM3
+const TEE_REPORT_DATA_LEN: usize = 64;
 
 enum Transport {
     Vsock(VsockStream),
@@ -161,7 +162,8 @@ impl AttestationDriver {
             .to_tpms_ecc_point(&curve.curve_ops().map_err(AttestationError::Crypto)?)
             .map_err(AttestationError::Crypto)?;
 
-        let evidence = evidence(&self.tee, hash(&n, &pub_key)?)?;
+        let digest = hash(&n, &pub_key)?;
+        let evidence = evidence(&self.tee, prepare_report_data(&digest)?)?;
 
         let req = AttestationRequest {
             tee: self.tee,
@@ -293,6 +295,8 @@ pub enum AttestationError {
     Crypto(CryptoError),
     /// Guest has failed attestation.
     Failed,
+    /// Negotiation Response challenge length from KBS is invalid
+    InvalidChallengeLength,
     // Unable to derive wrap key.
     KeyDerivation(concat_kdf::Error),
     /// Error deserializing the negotiation response from JSON bytes.
@@ -361,12 +365,12 @@ fn evidence(tee: &Tee, hash: Vec<u8>) -> Result<AttestationEvidence, Attestation
 
             // Get the attestation report as bytes for serialization in the
             // AttestationRequest.
-            let report =
+            let attestation_report =
                 try_to_vec(resp.report().as_bytes()).or(Err(AttestationError::VecAlloc))?;
 
             AttestationEvidence::Snp {
-                report,
-                certs_buf: None,
+                attestation_report,
+                cert_chain: None,
             }
         }
         // We check for supported TEE architectures in the AttestationDriver's constructor.
@@ -432,4 +436,16 @@ fn hash(
 
         try_to_vec(&sha.finalize()).or(Err(AttestationError::VecAlloc))
     }
+}
+
+/// Take variable-sized negotiation challenge nonce from aproxy into 64 byte array required for the TEE attestation evidence report
+fn prepare_report_data(challenge_digest: &[u8]) -> Result<Vec<u8>, AttestationError> {
+    if challenge_digest.len() > TEE_REPORT_DATA_LEN {
+        return Err(AttestationError::InvalidChallengeLength);
+    }
+
+    let mut report_data = [0u8; TEE_REPORT_DATA_LEN];
+    report_data[..challenge_digest.len()].copy_from_slice(challenge_digest);
+
+    Ok(report_data.to_vec())
 }
