@@ -220,7 +220,7 @@ cargo run -- --measurement $MEASUREMENT
 Start the proxy in another terminal:
 
 ```
-bin/aproxy --protocol kbs --url http://0.0.0.0:8080 --vsock
+bin/aproxy --protocol sample-kbs --url http://0.0.0.0:8080 --vsock
 ```
 
 Launch the guest:
@@ -234,7 +234,7 @@ Launch the guest:
 Start the proxy in another terminal:
 
 ```
-bin/aproxy --protocol kbs --url http://0.0.0.0:8080 --unix /tmp/svsm-proxy.sock --force
+bin/aproxy --protocol sample-kbs --url http://0.0.0.0:8080 --unix /tmp/svsm-proxy.sock --force
 ```
 
 Launch the guest:
