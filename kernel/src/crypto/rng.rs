@@ -107,6 +107,17 @@ impl SvsmRng {
             rng: Some(box_try_new(chained_rng).map_err(|_| CryptoError::MemoryAllocationFailure)?),
         })
     }
+
+    /// Fill a slice with cryptographically secure random bytes.
+    pub fn fill_bytes(&mut self, buf: &mut [u8]) -> Result<(), CryptoError> {
+        use cocoon_tpm_crypto::rng::RngCore;
+
+        self.generate::<_, EmptyCryptoIoSlices>(
+            io_slices::SingletonIoSliceMut::new(buf).map_infallible_err(),
+            None,
+        )
+        .map_err(|_| CryptoError::Internal)
+    }
 }
 
 impl rng::RngCore for SvsmRng {

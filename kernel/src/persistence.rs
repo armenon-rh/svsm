@@ -681,6 +681,53 @@ fn instantiate_cocoonfs_open_fut(
     box_try_new(cocoonfs_open_fut).map_err(NvFsError::from)
 }
 
+pub const UUID_SECRET_STORAGE: [u8; 16] = [
+    0xbc, 0x27, 0xdd, 0xb0, 0x0b, 0x61, 0x4f, 0xa3, 0x97, 0x9a, 0xca, 0x81, 0xf4, 0xa4, 0x76, 0xbc,
+];
+pub const UUID_SESSION_NONCE: [u8; 16] = [
+    0xaa, 0xbb, 0xcc, 0xdd, 0x11, 0x22, 0x33, 0x44, 0x55, 0x66, 0x77, 0x88, 0x99, 0x00, 0xaa, 0xbb,
+];
+
+/// Versioned binary header stored under UUID_SESSION_NONCE in CocoonFS AuxFsMetadata
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct AntiReplayHeader {
+    pub version: u8,
+    pub boot_counter: u64,
+    pub nonce: [u8; 16],
+}
+
+impl AntiReplayHeader {
+    pub fn from_bytes(bytes: &[u8]) -> Option<Self> {
+        if bytes.len() >= 26 {
+            Some(Self {
+                version: bytes[0],
+                boot_counter: u64::from_le_bytes(bytes[2..10].try_into().ok()?),
+                nonce: bytes[10..26].try_into().ok()?,
+            })
+        } else {
+            None
+        }
+    }
+
+    pub fn to_bytes(&self) -> [u8; 26] {
+        let mut buf = [0u8; 26];
+        buf[0] = self.version;
+        buf[1] = 0; // reserved flags
+        buf[2..10].copy_from_slice(&self.boot_counter.to_le_bytes());
+        buf[10..26].copy_from_slice(&self.nonce);
+        buf
+    }
+}
+
+/// Boot information extracted from CocoonFS auxiliary metadata
+#[derive(Debug, Clone)]
+pub struct BootMetadataInfo {
+    pub version: u8,
+    pub boot_counter: u64,
+    pub disk_nonce: [u8; 16],
+    pub resource_id: alloc::string::String,
+}
+
 /// Persistence metadata info returned by [`persistence_discover()`].
 ///
 /// `PersistenceBootstrapInfo` gets returned by [`persistence_discover()`], is supposed to serve as
@@ -696,6 +743,87 @@ impl PersistenceBootstrapInfo {
     /// Access the metadata.
     pub fn get_fs_metadata(&self) -> &cocoonfs::FsMetadata {
         &self.fs_metadata
+    }
+
+    /// Extract boot information (nonce, boot counter, resource ID) from unencrypted AuxFsMetadata.
+    pub fn extract_boot_info(&self) -> Option<BootMetadataInfo> {
+        let aux = match &self.fs_metadata {
+            cocoonfs::FsMetadata::Formatted(formatted) => formatted.get_aux(),
+            _ => return None,
+        };
+
+        let mut header = AntiReplayHeader {
+            version: 1,
+            boot_counter: 1,
+            nonce: [0u8; 16],
+        };
+        let mut resource_id = None;
+
+        for (entry_uuid, entry_data) in aux.iter() {
+            if entry_uuid == &UUID_SESSION_NONCE {
+                if let Some(parsed) = AntiReplayHeader::from_bytes(entry_data) {
+                    header = parsed;
+                }
+            } else if entry_uuid == &UUID_SECRET_STORAGE {
+                if let Ok(s) = alloc::string::String::from_utf8(entry_data.to_vec()) {
+                    resource_id = Some(s);
+                }
+            }
+        }
+
+        Some(BootMetadataInfo {
+            version: header.version,
+            boot_counter: header.boot_counter,
+            disk_nonce: header.nonce,
+            resource_id: resource_id
+                .unwrap_or_else(|| alloc::string::String::from("default/sample/test")),
+        })
+    }
+
+    /// Roll the session nonce and increment the boot counter in the unencrypted disk header offline.
+    pub fn roll_nonce(self, new_nonce: &[u8; 16], new_counter: u64) -> Result<Self, SvsmError> {
+        let PersistenceBootstrapInfo {
+            blkdev,
+            fs_metadata,
+        } = self;
+
+        let formatted = match &fs_metadata {
+            cocoonfs::FsMetadata::Formatted(formatted) => formatted,
+            _ => return Err(SvsmError::FileSystem(FsError::Inval)),
+        };
+
+        let header = AntiReplayHeader {
+            version: 1,
+            boot_counter: new_counter,
+            nonce: *new_nonce,
+        };
+        let serialized = header.to_bytes();
+
+        let mut updated_aux = formatted
+            .get_aux()
+            .try_clone()
+            .map_err(|_| SvsmError::Alloc(AllocError::OutOfMemory))?;
+        let _ = updated_aux.remove_entry(UUID_SESSION_NONCE, 0);
+        updated_aux
+            .add_entry(&UUID_SESSION_NONCE, &serialized)
+            .map_err(|_| SvsmError::FileSystem(FsError::Inval))?;
+
+        let mut write_fut =
+            cocoonfs::WriteAuxFsMetadataOfflineFuture::new(blkdev, fs_metadata, updated_aux);
+        match task_busypoll_to_completion(|cx| Future::poll(pin::Pin::new(&mut write_fut), cx)) {
+            Ok((ret_blkdev, Ok(new_metadata))) => {
+                log::info!("Successfully committed rolled session nonce and boot counter to disk");
+                Ok(Self {
+                    blkdev: ret_blkdev,
+                    fs_metadata: new_metadata,
+                })
+            }
+            Ok((_ret_blkdev, Err(e))) => {
+                log::error!("Failed to write updated aux metadata: {e:?}");
+                Err(nvfs_error_to_svsm_error(e))
+            }
+            Err(e) => Err(nvfs_error_to_svsm_error(e)),
+        }
     }
 }
 
