@@ -719,14 +719,7 @@ impl AntiReplayHeader {
     }
 }
 
-/// Boot information extracted from CocoonFS auxiliary metadata
-#[derive(Debug, Clone)]
-pub struct BootMetadataInfo {
-    pub version: u8,
-    pub boot_counter: u64,
-    pub disk_nonce: [u8; 16],
-    pub resource_id: alloc::string::String,
-}
+pub use crate::attest::BootMetadataInfo;
 
 /// Persistence metadata info returned by [`persistence_discover()`].
 ///
