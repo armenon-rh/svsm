@@ -55,21 +55,30 @@ enum ArgsBackend {
     TrusteeKbs,
 }
 
-fn accept_loop<S: Read + Write>(
+fn accept_loop<S: Read + Write + Send + 'static>(
     incoming: impl Iterator<Item = std::io::Result<S>>,
     url: &str,
     backend: ArgsBackend,
 ) -> anyhow::Result<()> {
     for stream in incoming {
         let mut stream = stream.context("Failed to accept connection")?;
-        log::info!("accepted incoming connection from SVSM");
-        let mut http_client = backend::HttpClient::new(url.to_string(), backend.into())?;
-        if let Err(e) = attest::attest(&mut stream, &mut http_client) {
-            log::error!("attestation failed: {e:#}");
-            continue;
-        }
+        let url_str = url.to_string();
+        std::thread::spawn(move || {
+            log::info!("accepted incoming connection from SVSM");
+            let mut http_client = match backend::HttpClient::new(url_str, backend.into()) {
+                Ok(c) => c,
+                Err(e) => {
+                    log::error!("failed to create HttpClient: {e:#}");
+                    return;
+                }
+            };
+            if let Err(e) = attest::attest(&mut stream, &mut http_client) {
+                log::error!("attestation failed: {e:#}");
+                return;
+            }
 
-        log::info!("attestation successful");
+            log::info!("attestation session closed cleanly");
+        });
     }
     Ok(())
 }

@@ -19,8 +19,19 @@ pub fn attest(
     negotiation(stream, http)?;
     attestation(stream, http)?;
 
-    let mut buf = Vec::new();
-    stream.read_to_end(&mut buf)?;
+    // Handle optional subsequent requests from SVSM (e.g. RollNonceRequest)
+    if let Ok(payload) = proxy_read(stream) {
+        if let Ok(req) = serde_json::from_slice::<RollNonceRequest>(&payload) {
+            let resp = http.roll_nonce(req)?;
+            proxy_write(stream, resp)?;
+        }
+    }
+
+    // Keep session alive while SVSM stream remains connected.
+    // When SVSM terminates, reboots, or powers off, stream.read returns EOF (0 bytes).
+    let mut buf = [0u8; 1];
+    let _ = stream.read(&mut buf);
+    log::info!("SVSM stream disconnected, ending attestation lease session");
 
     Ok(())
 }
