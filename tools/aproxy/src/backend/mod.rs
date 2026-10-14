@@ -35,24 +35,38 @@ impl HttpClient {
     pub fn negotiation(&mut self, req: NegotiationRequest) -> anyhow::Result<NegotiationResponse> {
         // Depending on the underlying protocol of the attestation server, gather negotiation
         // parameters accordingly.
-        let mut protocol = self.protocol;
-        match &mut protocol {
+        let mut protocol = self.protocol.clone();
+        let res = match &mut protocol {
             Protocol::SampleKbs(kbs) => kbs.negotiation(self, req),
             Protocol::TrusteeKbs(kbs) => kbs.negotiation(self, req),
-        }
+        };
+        self.protocol = protocol;
+        res
     }
 
     pub fn attestation(&mut self, req: AttestationRequest) -> anyhow::Result<AttestationResponse> {
-        let mut protocol = self.protocol;
-        match &mut protocol {
+        let mut protocol = self.protocol.clone();
+        let res = match &mut protocol {
             Protocol::SampleKbs(kbs) => kbs.attestation(self, req),
             Protocol::TrusteeKbs(kbs) => kbs.attestation(self, req),
-        }
+        };
+        self.protocol = protocol;
+        res
+    }
+
+    pub fn roll_nonce(&mut self, req: RollNonceRequest) -> anyhow::Result<RollNonceResponse> {
+        let mut protocol = self.protocol.clone();
+        let res = match &mut protocol {
+            Protocol::SampleKbs(kbs) => kbs.roll_nonce(self, req),
+            Protocol::TrusteeKbs(kbs) => kbs.roll_nonce(self, req),
+        };
+        self.protocol = protocol;
+        res
     }
 }
 
 /// Attestation Protocol identifier.
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Debug)]
 pub enum Protocol {
     SampleKbs(KbsProtocol<SampleKbs>),
     TrusteeKbs(KbsProtocol<TrusteeKbs>),
@@ -80,4 +94,9 @@ pub trait AttestationProtocol {
         client: &mut HttpClient,
         req: AttestationRequest,
     ) -> anyhow::Result<AttestationResponse>;
+    fn roll_nonce(
+        &mut self,
+        client: &mut HttpClient,
+        req: RollNonceRequest,
+    ) -> anyhow::Result<RollNonceResponse>;
 }

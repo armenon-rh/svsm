@@ -159,6 +159,7 @@ dependencies = [
  "clap",
  "const_format",
  "env_logger",
+ "hex",
  "kbs-types",
  "libaproxy",
  "log",
