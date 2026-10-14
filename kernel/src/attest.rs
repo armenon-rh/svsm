@@ -124,12 +124,24 @@ impl TryFrom<Tee> for AttestationDriver {
     }
 }
 
+/// Boot information (nonce, boot counter, resource ID) passed to attestation.
+#[derive(Debug, Clone)]
+pub struct BootMetadataInfo {
+    pub version: u8,
+    pub boot_counter: u64,
+    pub disk_nonce: [u8; 16],
+    pub resource_id: alloc::string::String,
+}
+
 impl AttestationDriver {
     /// Attest SVSM's launch state by communicating with the attestation proxy.
-    pub fn attest(&mut self) -> Result<SecretSlice, SvsmError> {
+    pub fn attest(
+        &mut self,
+        boot_info: Option<&BootMetadataInfo>,
+    ) -> Result<SecretSlice, SvsmError> {
         let negotiation = self.negotiation()?;
 
-        Ok(self.attestation(negotiation)?)
+        Ok(self.attestation(negotiation, boot_info)?)
     }
 
     /// Send a negotiation request to the proxy. Proxy should reply with Negotiation parameters
@@ -150,7 +162,11 @@ impl AttestationDriver {
     /// Send an attestation request to the proxy. Proxy should reply with attestation response
     /// containing the status (success/fail) and an optional secret returned from the server upon
     /// successful attestation.
-    fn attestation(&mut self, n: NegotiationResponse) -> Result<SecretSlice, AttestationError> {
+    fn attestation(
+        &mut self,
+        n: NegotiationResponse,
+        boot_info: Option<&BootMetadataInfo>,
+    ) -> Result<SecretSlice, AttestationError> {
         let curve =
             Curve::new(self.ecc.pub_key().get_curve_id()).map_err(AttestationError::Crypto)?;
 
@@ -173,7 +189,7 @@ impl AttestationDriver {
                 formatter.format(&nonce, &pub_key)?
             }
             PayloadFormat::JwsJson => {
-                let formatter = JwsJsonFormatter;
+                let formatter = JwsJsonFormatter { boot_info };
                 formatter.format(&nonce, &pub_key)?
             }
         };
@@ -185,6 +201,9 @@ impl AttestationDriver {
             evidence,
             challenge: n.challenge.clone(),
             key: (self.ecc.pub_key().get_curve_id(), &pub_key).into(),
+            resource_id: boot_info.map(|b| alloc::string::String::from(b.resource_id.as_str())),
+            boot_counter: boot_info.map(|b| b.boot_counter),
+            disk_nonce: boot_info.map(|b| b.disk_nonce.to_vec()),
         };
 
         self.write(req)?;
@@ -213,6 +232,41 @@ impl AttestationDriver {
         self.decrypt(&mut secret_slice, decryption)?;
 
         Ok(secret_slice)
+    }
+
+    /// Roll the anti-replay nonce and boot counter on the remote KBS server.
+    pub fn roll_nonce(
+        &mut self,
+        version: u8,
+        resource_id: &str,
+        boot_counter: u64,
+        new_nonce: &[u8; 16],
+    ) -> Result<(), SvsmError> {
+        let req = RollNonceRequest {
+            version,
+            resource_id: alloc::string::String::from(resource_id),
+            new_boot_counter: boot_counter,
+            new_nonce: new_nonce.to_vec(),
+        };
+
+        self.write(req)?;
+        let payload = self.read()?;
+
+        let response: RollNonceResponse = serde_json::from_slice(&payload)
+            .map_err(|_| AttestationError::AttestationDeserialize)?;
+
+        if response.success {
+            Ok(())
+        } else {
+            log::warn!("KBS roll nonce failed: {:?}", response.error_msg);
+            Err(SvsmError::TeeAttestation(AttestationError::Failed))
+        }
+    }
+
+    /// Keep the underlying transport stream connected to maintain the active lease with the proxy.
+    pub fn keep_alive(self) {
+        // Prevent destructor from sending shutdown RST to the host
+        core::mem::forget(self.transport);
     }
 
     /// Decrypt a secret from the attestation server with the TEE private key. Secrets are
@@ -431,9 +485,22 @@ impl PayloadFormatter for RawBinaryFormatter {
     }
 }
 
-struct JwsJsonFormatter;
+fn hex_encode(bytes: &[u8]) -> alloc::string::String {
+    const HEX_CHARS: &[u8; 16] = b"0123456789abcdef";
+    let mut v = alloc::vec::Vec::with_capacity(bytes.len() * 2);
+    for &b in bytes {
+        v.push(HEX_CHARS[(b >> 4) as usize]);
+        v.push(HEX_CHARS[(b & 0xf) as usize]);
+    }
+    // SAFETY: ASCII characters are valid UTF-8
+    unsafe { alloc::string::String::from_utf8_unchecked(v) }
+}
 
-impl PayloadFormatter for JwsJsonFormatter {
+struct JwsJsonFormatter<'a> {
+    boot_info: Option<&'a BootMetadataInfo>,
+}
+
+impl PayloadFormatter for JwsJsonFormatter<'_> {
     fn format(
         &self,
         challenge: &[u8],
@@ -455,8 +522,18 @@ impl PayloadFormatter for JwsJsonFormatter {
 
         let mut runtime_data = BTreeMap::new();
         runtime_data.insert("additional-evidence".to_string(), json!(""));
+        if let Some(info) = self.boot_info {
+            runtime_data.insert("boot_counter".to_string(), json!(info.boot_counter));
+            runtime_data.insert(
+                "disk_nonce".to_string(),
+                json!(hex_encode(&info.disk_nonce)),
+            );
+        }
         runtime_data.insert("nonce".to_string(), json!(nonce_encoded));
         runtime_data.insert("tee-pubkey".to_string(), json!(key_map));
+        if let Some(info) = self.boot_info {
+            runtime_data.insert("version".to_string(), json!(info.version));
+        }
 
         serde_json::to_vec(&runtime_data).map_err(|_| AttestationError::NegotiationSerialize)
     }
@@ -521,7 +598,7 @@ mod tests {
         let y = vec![0x20; 66];
         let pub_key = make_ecc_point(&x, &y);
 
-        let formatter = JwsJsonFormatter;
+        let formatter = JwsJsonFormatter { boot_info: None };
         let formatted = formatter.format(&challenge, &pub_key).unwrap();
 
         let json_val: serde_json::Value = serde_json::from_slice(&formatted).unwrap();
@@ -534,5 +611,32 @@ mod tests {
             "ECDH-ES+A256KW"
         );
         assert_eq!(json_val["additional-evidence"].as_str().unwrap(), "");
+    }
+
+    #[test]
+    fn test_jws_json_formatter_with_boot_info() {
+        let challenge = vec![0xdd; 48];
+        let x = vec![0x10; 66];
+        let y = vec![0x20; 66];
+        let pub_key = make_ecc_point(&x, &y);
+
+        let boot_info = BootMetadataInfo {
+            version: 1,
+            boot_counter: 42,
+            disk_nonce: [0xaa; 16],
+            resource_id: alloc::string::String::from("default/test"),
+        };
+        let formatter = JwsJsonFormatter {
+            boot_info: Some(&boot_info),
+        };
+        let formatted = formatter.format(&challenge, &pub_key).unwrap();
+
+        let json_val: serde_json::Value = serde_json::from_slice(&formatted).unwrap();
+        assert_eq!(json_val["boot_counter"].as_u64().unwrap(), 42);
+        assert_eq!(
+            json_val["disk_nonce"].as_str().unwrap(),
+            "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+        );
+        assert_eq!(json_val["version"].as_u64().unwrap(), 1);
     }
 }

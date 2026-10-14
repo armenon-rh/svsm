@@ -469,15 +469,17 @@ fn free_init_bsp_stack() {
 }
 
 #[cfg(all(feature = "attest", not(test_in_svsm)))]
-fn run_attestation() -> Result<SecretSlice, SvsmError> {
+fn run_attestation(
+    boot_info: Option<&svsm::attest::BootMetadataInfo>,
+) -> Result<(SecretSlice, svsm::attest::AttestationDriver), SvsmError> {
     use kbs_types::Tee;
     use svsm::attest::AttestationDriver;
 
     let mut proxy = AttestationDriver::try_from(Tee::Snp)?;
-    let secret = proxy.attest()?;
+    let secret = proxy.attest(boot_info)?;
     log::info!("attestation successful");
 
-    Ok(secret)
+    Ok((secret, proxy))
 }
 
 fn svsm_init(launch_info: &KernelLaunchInfo) {
@@ -562,18 +564,60 @@ fn svsm_init(launch_info: &KernelLaunchInfo) {
 
     #[cfg(all(feature = "attest", not(test_in_svsm)))]
     {
-        // Obtain the persistence metadata first. It's not the case yet,
-        // but it likely will be needed as input to the attestation.
+        // Obtain the persistence metadata first to serve as input to attestation.
         #[cfg(feature = "persistence")]
         let persistence_bootstrap_info = persistence_discover().unwrap();
 
-        match run_attestation() {
-            Ok(secret) => {
+        #[cfg(feature = "persistence")]
+        let boot_info = persistence_bootstrap_info
+            .as_ref()
+            .and_then(|info| info.extract_boot_info());
+
+        #[cfg(feature = "persistence")]
+        let attest_input = boot_info.as_ref();
+        #[cfg(not(feature = "persistence"))]
+        let attest_input = None;
+
+        match run_attestation(attest_input) {
+            Ok((secret, driver)) => {
                 #[cfg(not(feature = "persistence"))]
-                let _ = secret;
+                let _ = (secret, driver);
                 #[cfg(feature = "persistence")]
-                if let Some(persistence_bootstrap_info) = persistence_bootstrap_info {
-                    persistence_init(persistence_bootstrap_info, &secret).unwrap();
+                if let Some(bootstrap_info) = persistence_bootstrap_info {
+                    let mut driver = driver;
+                    if let Some(info) = boot_info {
+                        let next_boot_counter = info.boot_counter + 1;
+                        let mut new_nonce = [0u8; 16];
+                        svsm::crypto::get_svsm_rng()
+                            .expect("failed to get RNG")
+                            .fill_bytes(&mut new_nonce)
+                            .expect("failed to generate random nonce");
+
+                        // 1. Commit rolled nonce and incremented counter to disk offline
+                        let bootstrap_info = bootstrap_info
+                            .roll_nonce(&new_nonce, next_boot_counter)
+                            .expect("failed to roll nonce on storage");
+
+                        // 2. Unlock and mount CocoonFS
+                        persistence_init(bootstrap_info, &secret).unwrap();
+                        log::info!("CocoonFS persistence initialized successfully");
+
+                        // 3. Roll nonce on KBS via proxy
+                        if let Err(e) = driver.roll_nonce(
+                            info.version,
+                            &info.resource_id,
+                            next_boot_counter,
+                            &new_nonce,
+                        ) {
+                            log::error!("failed to roll nonce on KBS: {e:?}");
+                        }
+
+                        // 4. Keep the transport stream connected to maintain active lease with proxy
+                        driver.keep_alive();
+                    } else {
+                        persistence_init(bootstrap_info, &secret).unwrap();
+                        driver.keep_alive();
+                    }
                 }
             }
             Err(e) => {
