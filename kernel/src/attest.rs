@@ -12,6 +12,8 @@ use crate::{
     error::SvsmError,
     greq::{pld_report::*, services::get_regular_report},
     io::{Read, Write},
+    locking::SpinLockIrqSafe,
+    utils::immut_after_init::ImmutAfterInitCell,
     utils::vec::{try_to_vec, vec_sized},
 };
 #[cfg(feature = "attest-serial")]
@@ -101,6 +103,53 @@ pub struct AttestationDriver {
     transport: Transport,
     tee: Tee,
     ecc: EccKey,
+}
+
+/// State needed to keep issuing session-authenticated KBS calls (e.g. `sync_fs_counter`) after
+/// boot attestation has completed, from code paths other than the original boot sequence (e.g.
+/// the CocoonFS write-commit path in `kernel/src/persistence.rs`). Populated exactly once, by
+/// `AttestationDriver::keep_alive()`.
+///
+/// `resource_id` is `None` whenever this boot had no anti-replay-protected resource to begin
+/// with (see `keep_alive()`'s doc comment) -- in that case `attestation_sync_fs_counter()` is a
+/// no-op, since there is nothing registered on the KBS side to sync against.
+#[allow(missing_debug_implementations)]
+struct ActiveSession {
+    driver: AttestationDriver,
+    resource_id: Option<alloc::string::String>,
+}
+
+/// See [`ActiveSession`]. A `SpinLockIrqSafe` (rather than the read-only `ImmutAfterInitCell`
+/// alone, as used for e.g. `persistence::SVSM_COCOONFS_INSTANCE`) is required here because,
+/// unlike a mounted filesystem instance, this state needs to be *used* repeatedly over time
+/// (sending further messages), not just read once.
+static SVSM_ACTIVE_SESSION: ImmutAfterInitCell<SpinLockIrqSafe<ActiveSession>> =
+    ImmutAfterInitCell::uninit();
+
+/// Report the current CocoonFS filesystem update counter to KBS via the attestation driver
+/// stashed away by a prior call to [`AttestationDriver::keep_alive()`]. Returns `Ok(())`
+/// without making any call at all if this boot has no anti-replay-protected resource (i.e.
+/// `keep_alive()` was called with `resource_id: None`) -- there being nothing to sync against is
+/// the expected, non-error case for images that don't opt into this feature.
+///
+/// Intended to be called both once, immediately post-mount and before the filesystem becomes
+/// guest-visible, and again after every subsequently committed write -- see
+/// `FS_UPDATE_COUNTER_ANTI_SPLICE_PLAN.md` section 4. Callers must treat an `Err` return as
+/// fatal to whatever operation triggered it (OQ-3): a confirmed counter rejection means the
+/// on-disk state cannot be trusted.
+pub fn attestation_sync_fs_counter(fs_update_counter: &[u8; 16]) -> Result<(), SvsmError> {
+    let session_lock = SVSM_ACTIVE_SESSION
+        .try_get_inner()
+        .map_err(|_| SvsmError::TeeAttestation(AttestationError::NoActiveSession))?;
+
+    let mut session = session_lock.lock();
+    let Some(resource_id) = session.resource_id.clone() else {
+        return Ok(());
+    };
+
+    session
+        .driver
+        .sync_fs_counter(&resource_id, fs_update_counter)
 }
 
 impl TryFrom<Tee> for AttestationDriver {
@@ -263,10 +312,52 @@ impl AttestationDriver {
         }
     }
 
-    /// Keep the underlying transport stream connected to maintain the active lease with the proxy.
-    pub fn keep_alive(self) {
-        // Prevent destructor from sending shutdown RST to the host
-        core::mem::forget(self.transport);
+    /// Report the current CocoonFS filesystem update counter to KBS, authenticated by the
+    /// already-established session (not re-attested) -- same pattern as [`Self::roll_nonce`].
+    /// See `FS_UPDATE_COUNTER_ANTI_SPLICE_PLAN.md` section 4.
+    pub fn sync_fs_counter(
+        &mut self,
+        resource_id: &str,
+        fs_update_counter: &[u8; 16],
+    ) -> Result<(), SvsmError> {
+        let req = SyncFsCounterRequest {
+            resource_id: alloc::string::String::from(resource_id),
+            fs_update_counter: fs_update_counter.to_vec(),
+        };
+
+        self.write(req)?;
+        let payload = self.read()?;
+
+        let response: SyncFsCounterResponse = serde_json::from_slice(&payload)
+            .map_err(|_| AttestationError::AttestationDeserialize)?;
+
+        if response.success {
+            Ok(())
+        } else {
+            log::warn!("KBS sync_fs_counter failed: {:?}", response.error_msg);
+            Err(SvsmError::TeeAttestation(AttestationError::Failed))
+        }
+    }
+
+    /// Keep the underlying transport stream connected to maintain the active lease with the
+    /// proxy, by stashing the driver itself away in a global ([`SVSM_ACTIVE_SESSION`]) rather
+    /// than dropping it. Storing it in a `'static` global achieves the same thing the previous
+    /// `core::mem::forget`-based implementation did -- the value is never dropped, so
+    /// `VsockStream`'s `Drop` impl (which sends a connection-closing RST to the host) never
+    /// runs -- but, unlike `mem::forget`, leaves the driver *reachable* afterward, which is what
+    /// lets [`attestation_sync_fs_counter`] keep issuing further session-authenticated calls
+    /// (e.g. from the CocoonFS write-commit path) for the remaining lifetime of the guest.
+    ///
+    /// `resource_id` should be `Some` whenever this boot found an anti-replay-protected resource
+    /// (i.e. `BootMetadataInfo` was available) and `None` otherwise -- see
+    /// [`attestation_sync_fs_counter`]'s doc comment for what `None` means downstream.
+    pub fn keep_alive(self, resource_id: Option<&str>) {
+        SVSM_ACTIVE_SESSION
+            .init(SpinLockIrqSafe::new(ActiveSession {
+                driver: self,
+                resource_id: resource_id.map(alloc::string::String::from),
+            }))
+            .expect("attestation driver keep_alive() called more than once");
     }
 
     /// Decrypt a secret from the attestation server with the TEE private key. Secrets are
@@ -366,6 +457,9 @@ pub enum AttestationError {
     Failed,
     /// Negotiation Response challenge length from KBS is invalid
     InvalidChallengeLength,
+    /// `attestation_sync_fs_counter` called before `AttestationDriver::keep_alive()` ever ran
+    /// (should not happen in practice -- there is no active session to use).
+    NoActiveSession,
     // Unable to derive wrap key.
     KeyDerivation(concat_kdf::Error),
     /// Error deserializing the negotiation response from JSON bytes.

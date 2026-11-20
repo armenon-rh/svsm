@@ -150,6 +150,28 @@ pub struct RollNonceResponse {
     pub error_msg: Option<String>,
 }
 
+/// Request payload sent from SVSM to proxy to report CocoonFS's internal filesystem update
+/// counter to KBS. Authenticated by the already-established session lease (not re-attested),
+/// same as [`RollNonceRequest`]. Sent once immediately after mount (before the filesystem
+/// becomes guest-visible), and again after every subsequently committed write -- see
+/// `FS_UPDATE_COUNTER_ANTI_SPLICE_PLAN.md` section 4 for the full protocol.
+#[derive(Serialize, Deserialize, Debug, Clone)]
+pub struct SyncFsCounterRequest {
+    pub resource_id: String,
+    #[serde(
+        serialize_with = "serialize_base64",
+        deserialize_with = "deserialize_base64"
+    )]
+    pub fs_update_counter: Vec<u8>,
+}
+
+/// Response payload sent from proxy to SVSM indicating the status of the fs-counter sync.
+#[derive(Serialize, Deserialize, Debug, Clone)]
+pub struct SyncFsCounterResponse {
+    pub success: bool,
+    pub error_msg: Option<String>,
+}
+
 /// The attestation evidence based on the underlying TEE architecture.
 #[derive(Serialize, Deserialize, Debug)]
 pub enum AttestationEvidence {

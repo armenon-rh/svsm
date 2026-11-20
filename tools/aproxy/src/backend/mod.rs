@@ -63,6 +63,19 @@ impl HttpClient {
         self.protocol = protocol;
         res
     }
+
+    pub fn sync_fs_counter(
+        &mut self,
+        req: SyncFsCounterRequest,
+    ) -> anyhow::Result<SyncFsCounterResponse> {
+        let mut protocol = self.protocol.clone();
+        let res = match &mut protocol {
+            Protocol::SampleKbs(kbs) => kbs.sync_fs_counter(self, req),
+            Protocol::TrusteeKbs(kbs) => kbs.sync_fs_counter(self, req),
+        };
+        self.protocol = protocol;
+        res
+    }
 }
 
 /// Attestation Protocol identifier.
@@ -99,4 +112,9 @@ pub trait AttestationProtocol {
         client: &mut HttpClient,
         req: RollNonceRequest,
     ) -> anyhow::Result<RollNonceResponse>;
+    fn sync_fs_counter(
+        &mut self,
+        client: &mut HttpClient,
+        req: SyncFsCounterRequest,
+    ) -> anyhow::Result<SyncFsCounterResponse>;
 }

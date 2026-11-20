@@ -107,6 +107,10 @@ impl Drop for LeaseRefresher {
 pub struct KbsProtocol<B: KbsBackend> {
     backend: B,
     cached_token: Option<String>,
+    // Cached separately from `lease_refresher`'s own internal copy so sync_fs_counter (fired
+    // on every committed write, not just every 25s) can reuse it without needing to go through
+    // the refresher.
+    cached_session_id: Option<String>,
     lease_refresher: Option<Arc<LeaseRefresher>>,
 }
 
@@ -115,6 +119,7 @@ impl<B: KbsBackend> KbsProtocol<B> {
         Self {
             backend,
             cached_token: None,
+            cached_session_id: None,
             lease_refresher: None,
         }
     }
@@ -280,6 +285,7 @@ impl<B: KbsBackend> AttestationProtocol for KbsProtocol<B> {
                 sid.clone(),
             );
             self.lease_refresher = Some(Arc::new(refresher));
+            self.cached_session_id = Some(sid.clone());
         }
 
         let text = http_resp
@@ -348,6 +354,52 @@ impl<B: KbsBackend> AttestationProtocol for KbsProtocol<B> {
             let err_body = resp.text().unwrap_or_default();
             log::warn!("KBS /svsm/roll-nonce failed: {status} - {err_body}");
             Ok(RollNonceResponse {
+                success: false,
+                error_msg: Some(format!("KBS returned status {status}: {err_body}")),
+            })
+        }
+    }
+
+    /// Unlike `roll_nonce`, authenticated by the cached session_id rather than the attestation
+    /// token: this fires on every committed write (not just once per boot), so requiring a full
+    /// JWT verification here would reintroduce the same token-expiry failure already hit and
+    /// fixed for heartbeat/release-lease, except on the hottest path in the whole design.
+    fn sync_fs_counter(
+        &mut self,
+        http: &mut HttpClient,
+        req: SyncFsCounterRequest,
+    ) -> anyhow::Result<SyncFsCounterResponse> {
+        let Some(session_id) = &self.cached_session_id else {
+            return Ok(SyncFsCounterResponse {
+                success: false,
+                error_msg: Some("No active session lease found for sync_fs_counter".into()),
+            });
+        };
+
+        let url = format!("{}/kbs/v0/svsm/sync-fs-counter", http.url);
+        let payload = serde_json::json!({
+            "resource_id": req.resource_id,
+            "session_id": session_id,
+            "fs_update_counter": hex::encode(&req.fs_update_counter),
+        });
+
+        let resp = http
+            .cli
+            .post(&url)
+            .json(&payload)
+            .send()
+            .context("unable to POST to /kbs/v0/svsm/sync-fs-counter")?;
+
+        if resp.status().is_success() {
+            Ok(SyncFsCounterResponse {
+                success: true,
+                error_msg: None,
+            })
+        } else {
+            let status = resp.status();
+            let err_body = resp.text().unwrap_or_default();
+            log::warn!("KBS /svsm/sync-fs-counter failed: {status} - {err_body}");
+            Ok(SyncFsCounterResponse {
                 success: false,
                 error_msg: Some(format!("KBS returned status {status}: {err_body}")),
             })

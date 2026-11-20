@@ -55,7 +55,9 @@ use svsm::mm::ro_after_init::make_ro_after_init;
 use svsm::mm::validate::init_valid_bitmap;
 use svsm::mm::virtualrange::virt_log_usage;
 #[cfg(feature = "persistence")]
-use svsm::persistence::{persistence_discover, persistence_init};
+use svsm::persistence::{
+    persistence_discover, persistence_filesystem_update_counter, persistence_init,
+};
 use svsm::platform::PageValidateOp;
 use svsm::platform::PlatformPageType;
 use svsm::platform::SVSM_PLATFORM;
@@ -607,7 +609,25 @@ fn svsm_init(launch_info: &KernelLaunchInfo) {
                         persistence_init(bootstrap_info, &secret).unwrap();
                         log::info!("CocoonFS persistence initialized successfully");
 
-                        // 3. Roll nonce on KBS via proxy
+                        // 3. Report the (now readable) CocoonFS filesystem update counter to
+                        // KBS before the filesystem becomes guest-visible. Unlike roll-nonce
+                        // below, this is fatal on failure (OQ-3 in
+                        // FS_UPDATE_COUNTER_ANTI_SPLICE_PLAN.md): a rejection here means the
+                        // encrypted payload doesn't match what KBS expects for this resource's
+                        // plaintext header -- i.e. a spliced/rolled-back image -- and the guest
+                        // must never be allowed to observe anything from it.
+                        let fs_update_counter = persistence_filesystem_update_counter()
+                            .expect("persistence just succeeded, counter must be available");
+                        if let Err(e) =
+                            driver.sync_fs_counter(&info.resource_id, &fs_update_counter)
+                        {
+                            panic!(
+                                "fs_update_counter rejected by KBS -- possible splicing attack, \
+                                 refusing to continue boot with unverifiable CocoonFS state: {e:?}"
+                            );
+                        }
+
+                        // 4. Roll nonce on KBS via proxy
                         if let Err(e) = driver.roll_nonce(
                             info.version,
                             &info.resource_id,
@@ -617,11 +637,13 @@ fn svsm_init(launch_info: &KernelLaunchInfo) {
                             log::error!("failed to roll nonce on KBS: {e:?}");
                         }
 
-                        // 4. Keep the transport stream connected to maintain active lease with proxy
-                        driver.keep_alive();
+                        // 5. Keep the transport stream connected to maintain active lease with
+                        // proxy, and keep the driver reachable for further sync_fs_counter calls
+                        // from the CocoonFS write-commit path.
+                        driver.keep_alive(Some(&info.resource_id));
                     } else {
                         persistence_init(bootstrap_info, &secret).unwrap();
-                        driver.keep_alive();
+                        driver.keep_alive(None);
                     }
                 }
             }

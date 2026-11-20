@@ -19,21 +19,30 @@ pub fn attest(
     negotiation(stream, http)?;
     attestation(stream, http)?;
 
-    // Handle optional subsequent requests from SVSM (e.g. RollNonceRequest)
-    if let Ok(payload) = proxy_read(stream) {
+    // Handle subsequent requests from SVSM for the remainder of the guest's lifetime: an
+    // optional RollNonceRequest right after boot, and -- once CocoonFS anti-splicing is in
+    // play -- a SyncFsCounterRequest after every committed write, for as long as the guest
+    // runs. This loop is what keeps dispatching those; it only ends when SVSM disconnects
+    // (reboot, shutdown, or crash), at which point proxy_read's underlying read_exact hits EOF.
+    loop {
+        let payload = match proxy_read(stream) {
+            Ok(payload) => payload,
+            Err(_) => {
+                log::info!("SVSM stream disconnected, ending attestation lease session");
+                return Ok(());
+            }
+        };
+
         if let Ok(req) = serde_json::from_slice::<RollNonceRequest>(&payload) {
             let resp = http.roll_nonce(req)?;
             proxy_write(stream, resp)?;
+        } else if let Ok(req) = serde_json::from_slice::<SyncFsCounterRequest>(&payload) {
+            let resp = http.sync_fs_counter(req)?;
+            proxy_write(stream, resp)?;
+        } else {
+            log::warn!("received unrecognized message from SVSM, ignoring");
         }
     }
-
-    // Keep session alive while SVSM stream remains connected.
-    // When SVSM terminates, reboots, or powers off, stream.read returns EOF (0 bytes).
-    let mut buf = [0u8; 1];
-    let _ = stream.read(&mut buf);
-    log::info!("SVSM stream disconnected, ending attestation lease session");
-
-    Ok(())
 }
 
 /// Negotiation phase of SVSM attestation. SVSM will send a negotiation request indicating the

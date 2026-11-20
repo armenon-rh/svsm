@@ -169,3 +169,12 @@ unnecessary_box_returns = "warn"
 
 [workspace.metadata.scripts]
 vfmt = "verusfmt `find ./ -name *.verus.rs`"
+
+# TEMPORARY, for cross-repo co-development of the fs_update_counter anti-splice
+# feature (see ../FS_UPDATE_COUNTER_ANTI_SPLICE_PLAN.md): overrides the published
+# cocoon-tpm-storage 0.1.4 with the local checkout, which has the new
+# CocoonFs::read_filesystem_update_counter() getter this isn't published yet.
+# Remove this once cocoon-tpm publishes a release containing that getter and this
+# crate's `cocoon-tpm-storage` version requirement above is bumped to match.
+[patch.crates-io]
+cocoon-tpm-storage = { path = "../cocoon-tpm/storage" }

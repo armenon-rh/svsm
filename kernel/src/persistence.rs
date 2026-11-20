@@ -942,6 +942,74 @@ pub fn persistence_available() -> bool {
     SVSM_COCOONFS_INSTANCE.try_get_inner().is_ok()
 }
 
+/// Instantiate a [`cocoonfs::ReadFilesystemUpdateCounterFuture`].
+///
+/// Boxed for the same reason as the other `instantiate_cocoonfs_*_fut` helpers in this file:
+/// instantiating it in an `inline(never)` function and `Box`ing it right after hopefully frees
+/// up the stack allocations required for the moves again quickly.
+#[allow(clippy::type_complexity)]
+#[inline(never)]
+fn instantiate_cocoonfs_read_filesystem_update_counter_fut(
+    fs_instance: &pin::Pin<SvsmCocoonFsSyncRcPtrRefType<'_>>,
+) -> Result<
+    Box<
+        cocoonfs::ReadFilesystemUpdateCounterFuture<
+            SvsmSyncTypes,
+            SvsmNvBlkDev<&'static dyn BlockDriver>,
+        >,
+    >,
+    NvFsError,
+> {
+    let read_counter_fut = SvsmCocoonFsType::read_filesystem_update_counter(fs_instance);
+    box_try_new(read_counter_fut).map_err(NvFsError::from)
+}
+
+/// Returns the mounted filesystem's current update/generation counter (16 raw bytes, a
+/// monotonic 128-bit counter, little-endian, incremented once per committed transaction --
+/// see `FS_UPDATE_COUNTER_ANTI_SPLICE_PLAN.md` for the full protocol this feeds into), or
+/// `None` if persistence isn't available or the read itself failed.
+pub fn persistence_filesystem_update_counter() -> Option<[u8; 16]> {
+    let fs_instance = match SVSM_COCOONFS_INSTANCE.try_get_inner().ok() {
+        Some(fs_instance) => <pin::Pin<SvsmCocoonFsSyncRcPtrType> as sync_types::SyncRcPtr<
+            SvsmCocoonFsType,
+        >>::as_ref(fs_instance),
+        None => return None,
+    };
+
+    let mut rng = match get_svsm_rng() {
+        Ok(rng) => rng,
+        Err(e) => {
+            log::error!(
+                "persistence: failed to get rng instance for filesystem update counter read: {e:?}"
+            );
+            return None;
+        }
+    };
+
+    loop {
+        let result = instantiate_cocoonfs_read_filesystem_update_counter_fut(&fs_instance)
+            .and_then(|mut read_counter_fut| {
+                task_busypoll_to_completion(|cx| {
+                    NvFsFuture::poll(
+                        pin::Pin::new(&mut *read_counter_fut),
+                        &fs_instance,
+                        &mut rng,
+                        cx,
+                    )
+                })
+            });
+
+        match result {
+            Ok(counter) => return Some(counter),
+            Err(NvFsError::Retry) => {}
+            Err(e) => {
+                log::error!("persistence: failed to read filesystem update counter: {e:?}");
+                return None;
+            }
+        }
+    }
+}
+
 /// Instantiate a [`CocoonFs::StartTransactionFut`].
 ///
 /// The [`CocoonFs::StartTransactionFut`] is not exactly small -- by instantiating it in an
@@ -1135,6 +1203,16 @@ pub fn persistence_write_inode_sync(
 
         break;
     }
+
+    // Report the just-committed filesystem update counter to KBS before this write is
+    // considered complete -- fail-stop (OQ-3 in FS_UPDATE_COUNTER_ANTI_SPLICE_PLAN.md): the
+    // local commit above already happened and cannot be undone, but the write as a whole must
+    // not be reported as successful to its caller unless KBS has acknowledged the new counter
+    // value. This is a no-op (always `Ok`) if this boot has no anti-replay-protected resource
+    // at all -- see `attest::attestation_sync_fs_counter`'s doc comment.
+    let fs_update_counter = persistence_filesystem_update_counter()
+        .expect("just committed successfully, counter must be available");
+    crate::attest::attestation_sync_fs_counter(&fs_update_counter)?;
 
     Ok(data)
 }
